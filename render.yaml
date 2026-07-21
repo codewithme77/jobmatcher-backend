@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: jobmatcher-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: APP_NAME
+        value: JobMatcher API
+      - key: DEBUG
+        value: False
+      - key: DATABASE_URL
+        value: postgresql+psycopg2://postgres:postgres@localhost:54322/postgres
