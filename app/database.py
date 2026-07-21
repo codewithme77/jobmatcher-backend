@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_settings
@@ -9,7 +9,7 @@ if settings.database_url.startswith("postgres"):
     try:
         engine = create_engine(settings.database_url)
         with engine.connect() as connection:
-            connection.execute("select 1")
+            connection.execute(text("select 1"))
     except Exception:
         engine = create_engine("sqlite:///./jobmatcher.db")
 else:
