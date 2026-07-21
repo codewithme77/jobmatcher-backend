@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Job Matcher Frontend</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 2rem; }
+      input, button { margin-top: 0.5rem; display: block; }
+      #jobs { margin-top: 1rem; }
+      .job-card { border: 1px solid #ddd; padding: 1rem; margin-bottom: 1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Upload Resume and View Jobs</h1>
+    <input id="fileInput" type="file" accept=".pdf,.docx" />
+    <button id="uploadBtn">Upload Resume</button>
+    <div id="status">Choose a PDF or DOCX resume.</div>
+    <div id="jobs"></div>
+
+    <script>
+      const uploadBtn = document.getElementById('uploadBtn');
+      const fileInput = document.getElementById('fileInput');
+      const statusEl = document.getElementById('status');
+      const jobsEl = document.getElementById('jobs');
+
+      uploadBtn.addEventListener('click', async () => {
+        const file = fileInput.files[0];
+        if (!file) {
+          statusEl.textContent = 'Please select a file first.';
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        statusEl.textContent = 'Uploading...';
+
+        try {
+          const uploadResponse = await fetch('http://127.0.0.1:8001/upload-resume', {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (!uploadResponse.ok) {
+            const errorData = await uploadResponse.json();
+            throw new Error(errorData.detail || 'Upload failed');
+          }
+
+          const uploadData = await uploadResponse.json();
+          statusEl.textContent = `Resume uploaded. Extracted text: ${uploadData.extracted_text.slice(0, 120)}...`;
+
+          const jobsResponse = await fetch('http://127.0.0.1:8001/api/v1/jobs/sources');
+          if (!jobsResponse.ok) {
+            throw new Error('Could not fetch jobs');
+          }
+
+          const jobs = await jobsResponse.json();
+          jobsEl.innerHTML = '';
+
+          if (!jobs.length) {
+            jobsEl.innerHTML = '<p>No jobs found.</p>';
+            return;
+          }
+
+          jobs.forEach((job) => {
+            const card = document.createElement('div');
+            card.className = 'job-card';
+            card.innerHTML = `
+              <h3>${job.title}</h3>
+              <p><strong>Company:</strong> ${job.company}</p>
+              <p><strong>Location:</strong> ${job.location}</p>
+              <p><strong>Source:</strong> ${job.source}</p>
+              <p>${job.description}</p>
+              <a href="${job.url}" target="_blank">View job</a>
+            `;
+            jobsEl.appendChild(card);
+          });
+        } catch (error) {
+          statusEl.textContent = error.message;
+        }
+      });
+    </script>
+  </body>
+</html>
