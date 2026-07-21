@@ -3,15 +3,14 @@ services:
     name: jobmatcher-backend
     env: python
     plan: free
+    pythonVersion: 3.12
     healthCheckPath: /health
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: gunicorn app.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 60 --access-logfile - --error-logfile -
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
       - key: APP_NAME
         value: JobMatcher API
       - key: DEBUG
-        value: False
+        value: "False"
       - key: DATABASE_URL
         value: sqlite:///./jobmatcher.db
