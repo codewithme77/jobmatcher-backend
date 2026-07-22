@@ -54,8 +54,13 @@ def root():
 
 # --- API 2: Upload Resume ---
 COMMON_SKILLS = [
+    # Dev & Tech
     "python", "fastapi", "sql", "postgresql", "docker", "aws", 
-    "react", "javascript", "typescript", "node.js", "git", "rest api"
+    "react", "javascript", "typescript", "node.js", "git", "rest api",
+    # Product Management & Business
+    "product management", "product strategy", "agile", "scrum", 
+    "roadmapping", "jira", "analytics", "user research", "a/b testing",
+    "wireframing", "product lifecycle", "kpis", "stakeholder management"
 ]
 
 @app.post("/upload")
@@ -83,9 +88,13 @@ async def upload_resume(file: UploadFile = File(...)):
     }
 
 
-# --- API 3: Get Jobs ---
+# --- API 3: Get Jobs (Dynamic Search Enabled) ---
 @app.get("/jobs")
-def get_jobs():
+def get_jobs(
+    what: Optional[str] = None, 
+    where: Optional[str] = None, 
+    country: Optional[str] = "in"  # Use 'in' for India, 'us' for USA
+):
     app_id = os.getenv("ADZUNA_APP_ID")
     app_key = os.getenv("ADZUNA_APP_KEY")
 
@@ -93,26 +102,41 @@ def get_jobs():
         return [
             {
                 "id": "1",
-                "title": "Senior Python Developer",
-                "company": "Tech Corp",
-                "location": "Remote",
+                "title": "Principal Product Manager — AI Agent Platform",
+                "company": "Gupshup",
+                "location": "Mumbai",
                 "salary": 120000.0,
                 "url": "https://example.com/job/1",
-                "description": "Python, FastAPI, SQL, Docker required."
+                "description": "Product management, AI agent platform, strategy."
             },
             {
                 "id": "2",
-                "title": "Product Owner",
-                "company": "StartupX",
-                "location": "New York",
+                "title": "Senior Product Manager",
+                "company": "Tech Corp",
+                "location": "Remote",
                 "salary": 110000.0,
                 "url": "https://example.com/job/2",
-                "description": "Product management, agile, roadmaps."
+                "description": "Product roadmaps, agile development, user analytics."
             }
         ]
 
-    url = f"https://api.adzuna.com/v1/api/jobs/us/search/1?app_id={app_id}&app_key={app_key}&results_per_page=100"
-    res = requests.get(url)
+    # Target country API endpoint dynamically
+    target_country = country.lower() if country else "in"
+    url = f"https://api.adzuna.com/v1/api/jobs/{target_country}/search/1"
+    
+    params = {
+        "app_id": app_id,
+        "app_key": app_key,
+        "results_per_page": 50,
+        "content-type": "application/json"
+    }
+    
+    if what:
+        params["what"] = what
+    if where:
+        params["where"] = where
+
+    res = requests.get(url, params=params)
     if res.status_code != 200:
         return []
 
@@ -125,13 +149,13 @@ def get_jobs():
             "company": item.get("company", {}).get("display_name", ""),
             "location": item.get("location", {}).get("display_name", ""),
             "salary": float(item.get("salary_min", 0.0)),
-            "url": item.get("redirect_url"),
+            "url": item.get("redirect_url"),  # Direct application link
             "description": item.get("description", "")
         })
     return jobs
 
 
-# --- API 4: Match Jobs ---
+# --- API 4: Match Jobs (Preserves Full Job Metadata) ---
 @app.post("/match")
 def match_jobs(payload: MatchRequest):
     skills_str = " ".join(payload.skills)
@@ -140,12 +164,11 @@ def match_jobs(payload: MatchRequest):
     for job in payload.jobs:
         target_text = f"{job.title} {job.description}"
         score = fuzz.token_set_ratio(skills_str, target_text)
-        results.append({
-            "title": job.title,
-            "company": job.company,
-            "score": round(score, 1),
-            "url": job.url
-        })
+        
+        # Return complete job dictionary so UI card fields don't disappear
+        job_dict = job.dict()
+        job_dict["score"] = round(score, 1)
+        results.append(job_dict)
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
