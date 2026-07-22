@@ -125,7 +125,7 @@ def get_jobs():
             "company": item.get("company", {}).get("display_name", ""),
             "location": item.get("location", {}).get("display_name", ""),
             "salary": float(item.get("salary_min", 0.0)),
-            "url": item.get("redirect_url", ""),
+            "url": item.get("redirect_url"),
             "description": item.get("description", "")
         })
     return jobs
