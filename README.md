@@ -29,3 +29,4 @@ uvicorn app.main:app --reload
 ```
 
 Then browse to http://127.0.0.1:8000/docs for the interactive Swagger UI.
+
