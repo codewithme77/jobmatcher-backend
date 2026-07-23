@@ -3,6 +3,7 @@ import re
 import json
 import fitz  # PyMuPDF
 import requests
+import concurrent.futures
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,12 +20,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Expanded skills list for better extraction
 COMMON_SKILLS = [
-    "python", "fastapi", "sql", "postgresql", "docker", "aws", 
-    "react", "javascript", "typescript", "node.js", "git", "rest api",
-    "product management", "product strategy", "agile", "scrum", 
+    "python", "fastapi", "sql", "postgresql", "docker", "aws", "gcp", "azure",
+    "react", "javascript", "typescript", "node.js", "git", "rest api", "graphql",
+    "product management", "product strategy", "agile", "scrum", "kanban",
     "roadmapping", "jira", "analytics", "user research", "a/b testing",
-    "wireframing", "product lifecycle", "kpis", "stakeholder management"
+    "wireframing", "product lifecycle", "kpis", "stakeholder management",
+    "java", "c++", "c#", "ruby", "php", "go", "rust", "swift", "kotlin",
+    "machine learning", "data science", "ai", "nlp", "ci/cd", "kubernetes",
+    "html", "css", "tailwind", "figma", "ui/ux", "devops", "marketing", "sales",
+    "tableau", "power bi", "excel", "nosql", "mongodb", "redis"
 ]
 
 # --- Pydantic Models for Endpoints ---
@@ -37,13 +43,27 @@ class MatchRequest(BaseModel):
 
 class SaveRequest(BaseModel):
     job_id: str
-    action: str # e.g., "save", "apply"
+    action: str 
 
 # --- Helper Functions ---
 
+def parse_form_field(field_data: Optional[str]) -> str:
+    """Safely extracts form data whether it's plain text or a JSON stringified array."""
+    if not field_data:
+        return ""
+    try:
+        parsed = json.loads(field_data)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            return str(parsed[0]) # Extract first selected filter
+        elif isinstance(parsed, list):
+            return ""
+        return str(parsed)
+    except Exception:
+        return field_data
+
 def fetch_adzuna_jobs(query: str, location: str = "") -> List[Dict]:
     """Queries Adzuna API with keyword query and optional location."""
-    app_id = os.getenv("ADZUNA_APP_ID", "your_app_id") # Ensure env vars are set
+    app_id = os.getenv("ADZUNA_APP_ID", "your_app_id") 
     app_key = os.getenv("ADZUNA_APP_KEY", "your_app_key")
     
     if not app_id or not app_key:
@@ -79,36 +99,48 @@ def fetch_adzuna_jobs(query: str, location: str = "") -> List[Dict]:
             "company": item.get("company", {}).get("display_name", ""),
             "location": item.get("location", {}).get("display_name", ""),
             "salary": float(item.get("salary_min", 0.0)),
-            "url": item.get("redirect_url"), # Note: Adzuna only provides redirect URLs natively
+            "url": item.get("redirect_url"), 
             "description": item.get("description", "")
         })
     return jobs
 
+def resolve_job_url(job: Dict) -> Dict:
+    """Follows the Adzuna redirect link to find the direct job board application URL."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        # Follow the redirect to get the final destination
+        res = requests.get(job["url"], headers=headers, allow_redirects=True, timeout=5)
+        job["url"] = res.url
+    except Exception:
+        pass # Fallback to Adzuna link if timeout or error occurs
+    return job
+
 def calculate_job_scores(job: Dict, target_role: str, extracted_skills: List[str], 
-                         target_location: Optional[str], target_work_type: Optional[str], 
-                         target_experience: Optional[str]) -> Dict:
-    """Calculates granular match scores to prevent the 100/100 bug and populate the UI breakdown."""
+                         target_location: str, target_work_type: str, 
+                         target_experience: str) -> Dict:
+    """Calculates granular match scores with exact camelCase keys for Lovable UI."""
     title = job.get('title', '').lower()
     desc = job.get('description', '').lower()
     job_loc = job.get('location', '').lower()
     
-    # 1. Role Fit: Partial ratio matching user role to job title
-    role_fit = fuzz.partial_ratio(target_role.lower(), title)
+    # 1. Role Score
+    role_score = fuzz.partial_ratio(target_role.lower(), title)
+    if not target_role: role_score = 50
     
-    # 2. Domain / Skills Fit: Percentage of user's skills actually found in the job description
+    # 2. Skill Score 
     if extracted_skills:
         matched_skills = [skill for skill in extracted_skills if skill.lower() in desc]
-        domain_score = int((len(matched_skills) / len(extracted_skills)) * 100)
+        skill_score = int((len(matched_skills) / len(extracted_skills)) * 100)
     else:
-        domain_score = 50 # Default baseline if no skills extracted
+        skill_score = 50 
         
-    # 3. Location Fit
+    # 3. Location Score
     if target_location:
         location_score = fuzz.partial_ratio(target_location.lower(), job_loc)
     else:
-        location_score = 100 # No preference means location is a perfect fit
+        location_score = 100 
         
-    # 4. Work Type Fit (Heuristic check)
+    # 4. Work Type Score
     work_type_score = 80
     if target_work_type:
         wt_lower = target_work_type.lower()
@@ -119,7 +151,7 @@ def calculate_job_scores(job: Dict, target_role: str, extracted_skills: List[str
         else:
             work_type_score = 50
             
-    # 5. Experience Fit (Heuristic check)
+    # 5. Experience Score
     experience_score = 80
     if target_experience:
         exp_lower = target_experience.lower()
@@ -128,18 +160,17 @@ def calculate_job_scores(job: Dict, target_role: str, extracted_skills: List[str
         elif "junior" in title and "senior" in exp_lower:
             experience_score = 40
             
-    # Overall Composite Score (Weighted average)
-    overall_score = (role_fit * 0.35) + (domain_score * 0.30) + (location_score * 0.15) + (experience_score * 0.10) + (work_type_score * 0.10)
+    # Overall Composite Score 
+    overall_score = (role_score * 0.35) + (skill_score * 0.30) + (location_score * 0.15) + (experience_score * 0.10) + (work_type_score * 0.10)
     
-    # Merge new scores into the job dictionary
+    # Merging exact camelCase keys expected by frontend UI
     job.update({
-        "match_score": round(overall_score),
-        "matchScore": round(overall_score), # Duplicated for frontend compatibility 
-        "role_fit": round(role_fit),
-        "domain": round(domain_score),
-        "location": round(location_score),
-        "work_type": round(work_type_score),
-        "experience": round(experience_score)
+        "matchScore": round(overall_score), 
+        "roleScore": round(role_score),
+        "skillScore": round(skill_score),
+        "locationScore": round(location_score),
+        "workTypeScore": round(work_type_score),
+        "experienceScore": round(experience_score)
     })
     
     return job
@@ -150,64 +181,6 @@ def calculate_job_scores(job: Dict, target_role: str, extracted_skills: List[str
 def root():
     return {"status": "JobMatcher API is running"}
 
-@app.post("/upload")
-async def upload_resume(resume: UploadFile = File(...)):
-    """Extracts text and skills from a PDF upload (Satisfies /upload endpoint)."""
-    try:
-        contents = await resume.read()
-        doc = fitz.open(stream=contents, filetype="pdf")
-        text = "\n".join([page.get_text() for page in doc]).lower()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid PDF file")
-
-    extracted_skills = [
-        s for s in COMMON_SKILLS 
-        if re.search(r'\b' + re.escape(s) + r'\b', text)
-    ]
-    
-    return {"message": "Resume processed successfully", "extracted_skills": extracted_skills}
-
-@app.get("/jobs")
-def get_jobs(query: str = "Product Manager", location: str = ""):
-    """Fetches raw jobs (Satisfies /jobs endpoint)."""
-    jobs = fetch_adzuna_jobs(query=query, location=location)
-    return {"total": len(jobs), "jobs": jobs}
-
-@app.post("/match")
-def match_jobs(req: MatchRequest):
-    """Scores and ranks jobs based on extracted skills (Satisfies /match endpoint)."""
-    search_query = f"{req.target_role} " + " ".join(req.extracted_skills[:3])
-    raw_jobs = fetch_adzuna_jobs(query=search_query, location=req.location or "")
-
-    if not raw_jobs and req.location:
-        raw_jobs = fetch_adzuna_jobs(query=req.target_role, location="")
-
-    ranked_jobs = []
-    for job in raw_jobs:
-        scored_job = calculate_job_scores(
-            job, 
-            req.target_role, 
-            req.extracted_skills, 
-            req.location, 
-            req.work_types, 
-            req.experience
-        )
-        ranked_jobs.append(scored_job)
-
-    ranked_jobs.sort(key=lambda x: x["match_score"], reverse=True)
-    return {"total_matches": len(ranked_jobs), "jobs": ranked_jobs}
-
-@app.post("/filter")
-def filter_jobs(req: MatchRequest):
-    """Placeholder for advanced filtering logic (Satisfies /filter endpoint)."""
-    return {"message": "Filter applied", "jobs": []}
-
-@app.post("/save")
-def save_results(req: SaveRequest):
-    """Placeholder for saving job results to a database (Satisfies /save endpoint)."""
-    return {"message": f"Job {req.job_id} saved with action {req.action}"}
-
-# --- Legacy Lovable Endpoint ---
 @app.post("/upload-and-search")
 async def upload_and_search(
     resume: UploadFile = File(...),
@@ -216,7 +189,7 @@ async def upload_and_search(
     work_types: Optional[str] = Form(None),
     experience: Optional[str] = Form(None)
 ):
-    """Combined upload, match, and return logic for Lovable."""
+    """Combined upload, extract, filter, match, and URL-resolve logic."""
     # 1. Parse PDF
     try:
         contents = await resume.read()
@@ -231,40 +204,43 @@ async def upload_and_search(
         if re.search(r'\b' + re.escape(s) + r'\b', text)
     ]
 
-    # 3. Determine Search Query
-    target_role = "Product Manager"
-    if roles:
-        try:
-            parsed_roles = json.loads(roles)
-            if isinstance(parsed_roles, list) and len(parsed_roles) > 0:
-                target_role = parsed_roles[0]
-        except Exception:
-            target_role = roles
+    # 3. Parse user filters from Form Data
+    target_role = parse_form_field(roles) or "Software Engineer"
+    target_location = parse_form_field(location)
+    target_work_type = parse_form_field(work_types)
+    target_experience = parse_form_field(experience)
 
+    # 4. Build Query using Role + Top Skills + Filters
     search_query = f"{target_role} " + " ".join(extracted_skills[:3])
-
-    # 4. Query API
-    raw_jobs = fetch_adzuna_jobs(query=search_query, location=location or "")
-    if not raw_jobs and location:
+    
+    # 5. Query Adzuna
+    raw_jobs = fetch_adzuna_jobs(query=search_query, location=target_location)
+    if not raw_jobs and target_location:
         raw_jobs = fetch_adzuna_jobs(query=target_role, location="")
 
-    # 5. Score and Rank using the new robust logic
+    # 6. Score and Rank
     ranked_jobs = []
     for job in raw_jobs:
         scored_job = calculate_job_scores(
             job=job, 
             target_role=target_role, 
             extracted_skills=extracted_skills, 
-            target_location=location, 
-            target_work_type=work_types, 
-            target_experience=experience
+            target_location=target_location, 
+            target_work_type=target_work_type, 
+            target_experience=target_experience
         )
         ranked_jobs.append(scored_job)
 
-    ranked_jobs.sort(key=lambda x: x["match_score"], reverse=True)
+    # Sort descending by best match
+    ranked_jobs.sort(key=lambda x: x["matchScore"], reverse=True)
+    
+    # Limit to top 20 for performance, then resolve direct URLs concurrently
+    top_jobs = ranked_jobs[:20]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        top_jobs = list(executor.map(resolve_job_url, top_jobs))
 
     return {
         "extracted_skills": extracted_skills,
-        "total_matches": len(ranked_jobs),
-        "jobs": ranked_jobs
+        "total_matches": len(top_jobs),
+        "jobs": top_jobs
     }
