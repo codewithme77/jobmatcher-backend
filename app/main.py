@@ -4,6 +4,7 @@ import json
 import fitz  # PyMuPDF
 import requests
 from typing import List, Optional, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -28,41 +29,11 @@ COMMON_SKILLS = [
     "go-to-market", "gtm", "okr", "data analysis", "tableau",
     "salesforce", "crm", "machine learning", "ai", "generative ai",
     "growth", "monetization", "saas", "b2b", "b2c", "figma",
+    "cross-functional", "p&l", "mobile", "ios", "android",
 ]
 
-# Maps location keywords → Adzuna country code + canonical where-param
-# Adzuna country codes: gb, us, au, ca, de, fr, in, ae, sg, nz, za, nl, pl, ru, br
-LOCATION_MAP = {
-    "abu dhabi": ("ae", "Abu Dhabi"),
-    "dubai": ("ae", "Dubai"),
-    "uae": ("ae", ""),
-    "united arab emirates": ("ae", ""),
-    "sharjah": ("ae", "Sharjah"),
-    "ajman": ("ae", "Ajman"),
-    "remote": ("ae", ""),          # default remote to UAE since user is targeting UAE
-    "bangalore": ("in", "Bangalore"),
-    "bengaluru": ("in", "Bangalore"),
-    "mumbai": ("in", "Mumbai"),
-    "delhi": ("in", "Delhi"),
-    "hyderabad": ("in", "Hyderabad"),
-    "pune": ("in", "Pune"),
-    "india": ("in", ""),
-    "london": ("gb", "London"),
-    "new york": ("us", "New York"),
-    "singapore": ("sg", ""),
-}
 
-def get_country_and_where(location: str):
-    """Return (adzuna_country_code, where_param) from free-text location."""
-    if not location:
-        return "ae", ""   # default to UAE (user's target market)
-    loc_lower = location.lower().strip()
-    for keyword, (code, where) in LOCATION_MAP.items():
-        if keyword in loc_lower:
-            return code, where
-    # Unknown location — pass as-is to India endpoint as last resort
-    return "in", location
-
+# ── Pydantic models ──────────────────────────────────────────────────────────
 
 class MatchRequest(BaseModel):
     extracted_skills: List[str]
@@ -71,58 +42,179 @@ class MatchRequest(BaseModel):
     work_types: Optional[str] = None
     experience: Optional[str] = None
 
-
 class SaveRequest(BaseModel):
     job_id: str
     action: str
 
 
-def fetch_adzuna_jobs(query: str, location: str = "") -> List[Dict]:
-    """Fetch jobs from correct Adzuna country endpoint based on location."""
-    app_id = os.getenv("ADZUNA_APP_ID", "")
-    app_key = os.getenv("ADZUNA_APP_KEY", "")
-    if not app_id or not app_key:
-        print("Warning: Adzuna API keys not set.")
+# ── Source 1: JSearch (RapidAPI) — UAE/global, direct apply links ────────────
+
+def fetch_jsearch_jobs(query: str, location: str = "") -> List[Dict]:
+    api_key = os.getenv("JSEARCH_API_KEY", "")
+    if not api_key:
+        print("JSearch: no API key set, skipping.")
         return []
 
-    country, where_param = get_country_and_where(location)
-    url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/1"
+    # Build query string: "Product Manager in Dubai" style
+    q = f"{query} in {location}" if location else query
 
-    params = {
-        "app_id": app_id,
-        "app_key": app_key,
-        "results_per_page": 20,   # reduced from 50 → faster response
-        "what": query,
+    url = "https://jsearch.p.rapidapi.com/search"
+    headers = {
+        "X-RapidAPI-Key": api_key,
+        "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
     }
-    if where_param:
-        params["where"] = where_param
+    params = {
+        "query": q,
+        "page": "1",
+        "num_pages": "1",
+        "date_posted": "month",   # freshness filter
+    }
 
     try:
-        res = requests.get(url, params=params, timeout=10)
+        res = requests.get(url, headers=headers, params=params, timeout=10)
         if res.status_code != 200:
-            print(f"Adzuna {country} returned {res.status_code}")
+            print(f"JSearch returned {res.status_code}")
             return []
         data = res.json()
     except Exception as e:
-        print(f"Adzuna API Error: {e}")
+        print(f"JSearch error: {e}")
         return []
 
     jobs = []
-    for item in data.get("results", []):
-        # redirect_url IS the apply link — pass directly, open in new tab on frontend
-        apply_url = item.get("redirect_url", "")
+    for item in data.get("data", []):
+        # JSearch returns direct employer/ATS apply links
+        apply_url = (
+            item.get("job_apply_link")
+            or item.get("job_google_link")
+            or ""
+        )
         jobs.append({
-            "id": str(item.get("id", "")),
-            "title": item.get("title", ""),
-            "company": item.get("company", {}).get("display_name", ""),
-            "location": item.get("location", {}).get("display_name", ""),
-            "salary": float(item.get("salary_min", 0) or 0),
-            "url": apply_url,        # used by frontend for job detail click
-            "apply_url": apply_url,  # explicit field for Apply button
-            "description": item.get("description", ""),
+            "id": f"js_{item.get('job_id', '')}",
+            "title": item.get("job_title", ""),
+            "company": item.get("employer_name", ""),
+            "location": f"{item.get('job_city', '')} {item.get('job_country', '')}".strip(),
+            "salary": float(item.get("job_min_salary") or 0),
+            "url": apply_url,
+            "apply_url": apply_url,
+            "description": item.get("job_description", ""),
+            "source": "JSearch",
         })
     return jobs
 
+
+# ── Source 2: Arbeitnow — Europe + remote, no key needed ────────────────────
+
+def fetch_arbeitnow_jobs(query: str, location: str = "") -> List[Dict]:
+    url = "https://www.arbeitnow.com/api/job-board-api"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            return []
+        data = res.json()
+    except Exception as e:
+        print(f"Arbeitnow error: {e}")
+        return []
+
+    query_lower = query.lower()
+    loc_lower = location.lower() if location else ""
+
+    jobs = []
+    for item in data.get("data", []):
+        title = item.get("title", "")
+        tags = " ".join(item.get("tags", [])).lower()
+        desc = item.get("description", "")
+
+        # Client-side filter since API has no query param
+        if query_lower not in title.lower() and query_lower not in tags:
+            continue
+
+        apply_url = item.get("url", "")
+        jobs.append({
+            "id": f"an_{item.get('slug', '')}",
+            "title": title,
+            "company": item.get("company_name", ""),
+            "location": item.get("location", "Remote"),
+            "salary": 0.0,
+            "url": apply_url,
+            "apply_url": apply_url,
+            "description": desc,
+            "source": "Arbeitnow",
+        })
+        if len(jobs) >= 10:   # cap to keep response fast
+            break
+
+    return jobs
+
+
+# ── Source 3: RemoteOK — pure remote, no key needed ─────────────────────────
+
+def fetch_remoteok_jobs(query: str) -> List[Dict]:
+    url = "https://remoteok.com/api"
+    headers = {"User-Agent": "JobMatcherMVP/1.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code != 200:
+            return []
+        data = res.json()
+    except Exception as e:
+        print(f"RemoteOK error: {e}")
+        return []
+
+    query_lower = query.lower()
+    jobs = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("position", "")
+        tags = " ".join(item.get("tags", [])).lower() if item.get("tags") else ""
+        if query_lower not in title.lower() and query_lower not in tags:
+            continue
+
+        apply_url = item.get("url") or item.get("apply_url") or ""
+        jobs.append({
+            "id": f"ro_{item.get('id', '')}",
+            "title": title,
+            "company": item.get("company", ""),
+            "location": "Remote",
+            "salary": float(item.get("salary_min") or 0),
+            "url": apply_url,
+            "apply_url": apply_url,
+            "description": item.get("description", ""),
+            "source": "RemoteOK",
+        })
+        if len(jobs) >= 10:
+            break
+
+    return jobs
+
+
+# ── Fetch all sources in parallel ────────────────────────────────────────────
+
+def fetch_all_jobs(query: str, location: str = "") -> List[Dict]:
+    results = []
+    seen = set()   # deduplicate by (title_lower, company_lower)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(fetch_jsearch_jobs, query, location): "jsearch",
+            executor.submit(fetch_arbeitnow_jobs, query, location): "arbeitnow",
+            executor.submit(fetch_remoteok_jobs, query): "remoteok",
+        }
+        for future in as_completed(futures):
+            try:
+                jobs = future.result()
+                for job in jobs:
+                    key = (job["title"].lower().strip(), job["company"].lower().strip())
+                    if key not in seen:
+                        seen.add(key)
+                        results.append(job)
+            except Exception as e:
+                print(f"Fetch error: {e}")
+
+    return results
+
+
+# ── Scoring ──────────────────────────────────────────────────────────────────
 
 def calculate_job_scores(
     job: Dict,
@@ -149,9 +241,10 @@ def calculate_job_scores(
 
     # 3. Location fit
     if target_location:
-        _, canonical = get_country_and_where(target_location)
-        loc_to_match = canonical if canonical else target_location
-        location_score = fuzz.partial_ratio(loc_to_match.lower(), job_loc)
+        location_score = fuzz.partial_ratio(target_location.lower(), job_loc)
+        # Remote jobs score well for any location preference
+        if "remote" in job_loc:
+            location_score = max(location_score, 70)
     else:
         location_score = 100
 
@@ -159,7 +252,7 @@ def calculate_job_scores(
     work_type_score = 80
     if target_work_type:
         wt = target_work_type.lower()
-        if wt in desc or wt in title:
+        if wt in desc or wt in title or wt in job_loc:
             work_type_score = 100
         else:
             work_type_score = 50
@@ -173,7 +266,7 @@ def calculate_job_scores(
         elif "junior" in title and "senior" in exp:
             experience_score = 40
 
-    overall = (
+    overall = round(
         role_fit * 0.35
         + domain_score * 0.30
         + location_score * 0.15
@@ -181,32 +274,37 @@ def calculate_job_scores(
         + work_type_score * 0.10
     )
 
-    # Use EXACT field names the Lovable frontend reads (from score breakdown UI)
     job.update({
-        "match_score": round(overall),
-        "matchScore": round(overall),
-        # Score breakdown fields — matching what Lovable renders
-        "role_fit": round(role_fit),
-        "roleFit": round(role_fit),
-        "experience": round(experience_score),
-        "experienceScore": round(experience_score),
-        "location": round(location_score),          # NOTE: overwrites location string!
-        "locationScore": round(location_score),
-        "work_type": round(work_type_score),
-        "workType": round(work_type_score),
-        "domain": round(domain_score),
-        "domainScore": round(domain_score),
+        # Overall
+        "match_score": overall,
+        "matchScore": overall,
+        # Breakdown — all naming variants for Lovable frontend
+        "role_fit": role_fit,
+        "roleFit": role_fit,
+        "domain": domain_score,
+        "domainScore": domain_score,
+        "location_score": location_score,
+        "locationScore": location_score,
+        "location": location_score,       # what Lovable score breakdown reads
+        "work_type": work_type_score,
+        "workType": work_type_score,
+        "workTypeScore": work_type_score,
+        "experience": experience_score,
+        "experienceScore": experience_score,
+        # Skill breakdown list for popup
         "matched_skills": matched_skills,
         "matchedSkills": matched_skills,
-        # Preserve location string separately so UI can still show city
+        # Preserve city string separately
         "job_location": job.get("location", ""),
     })
     return job
 
 
+# ── Endpoints ────────────────────────────────────────────────────────────────
+
 @app.get("/")
 def root():
-    return {"status": "JobMatcher API is running"}
+    return {"status": "JobMatcher API is running — v3 (JSearch + Arbeitnow + RemoteOK)"}
 
 
 @app.post("/upload")
@@ -217,6 +315,7 @@ async def upload_resume(resume: UploadFile = File(...)):
         text = "\n".join([page.get_text() for page in doc]).lower()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid PDF file")
+
     extracted_skills = [
         s for s in COMMON_SKILLS
         if re.search(r"\b" + re.escape(s) + r"\b", text)
@@ -226,16 +325,14 @@ async def upload_resume(resume: UploadFile = File(...)):
 
 @app.get("/jobs")
 def get_jobs(query: str = "Product Manager", location: str = ""):
-    jobs = fetch_adzuna_jobs(query=query, location=location)
+    jobs = fetch_all_jobs(query=query, location=location)
     return {"total": len(jobs), "jobs": jobs}
 
 
 @app.post("/match")
 def match_jobs(req: MatchRequest):
-    search_query = f"{req.target_role} " + " ".join(req.extracted_skills[:3])
-    raw_jobs = fetch_adzuna_jobs(query=search_query, location=req.location or "")
-    if not raw_jobs:
-        raw_jobs = fetch_adzuna_jobs(query=req.target_role, location=req.location or "")
+    query = f"{req.target_role} " + " ".join(req.extracted_skills[:3])
+    raw_jobs = fetch_all_jobs(query=query.strip(), location=req.location or "")
 
     ranked = [
         calculate_job_scores(j, req.target_role, req.extracted_skills,
@@ -256,6 +353,8 @@ def save_results(req: SaveRequest):
     return {"message": f"Job {req.job_id} saved with action {req.action}"}
 
 
+# ── Primary Lovable endpoint ─────────────────────────────────────────────────
+
 @app.post("/upload-and-search")
 async def upload_and_search(
     resume: UploadFile = File(...),
@@ -272,13 +371,13 @@ async def upload_and_search(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid PDF file")
 
-    # 2. Extract skills
+    # 2. Extract skills from resume
     extracted_skills = [
         s for s in COMMON_SKILLS
         if re.search(r"\b" + re.escape(s) + r"\b", text)
     ]
 
-    # 3. Target role
+    # 3. Target role from filter selection
     target_role = "Product Manager"
     if roles:
         try:
@@ -287,13 +386,14 @@ async def upload_and_search(
         except Exception:
             target_role = roles.strip()
 
-    # 4. Fetch: role + top 3 skills (keep query tight for speed)
-    search_query = f"{target_role} " + " ".join(extracted_skills[:3])
-    raw_jobs = fetch_adzuna_jobs(query=search_query, location=location or "")
-    if not raw_jobs:
-        raw_jobs = fetch_adzuna_jobs(query=target_role, location=location or "")
+    # 4. Build query: role + top 3 skills (tight = faster + more relevant)
+    skill_terms = " ".join(extracted_skills[:3])
+    search_query = f"{target_role} {skill_terms}".strip()
 
-    # 5. Score + rank
+    # 5. Fetch all 3 sources in parallel
+    raw_jobs = fetch_all_jobs(query=search_query, location=location or "")
+
+    # 6. Score + rank
     ranked = [
         calculate_job_scores(
             job=j,
